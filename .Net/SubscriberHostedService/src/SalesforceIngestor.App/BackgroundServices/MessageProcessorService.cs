@@ -45,6 +45,8 @@ public class MessageProcessorService : BackgroundService
             
             //do something useful with the message
             _logger.LogDebug("Received: {ReplayId}/{Id}/{TopicName}", replayId, message.ConsumerEvent.Event.Id, message.TopicName);
+            _logger.LogDebug("Content is: {0}", des);
+
 
         }
 
