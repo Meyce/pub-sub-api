@@ -54,49 +54,66 @@ public class TopicSubscriptionManager
     /// <param name="stoppingToken"></param>
     public async Task RunAsync(CancellationToken stoppingToken)
     {
-        //store the schema for this topic
-        await CacheSchemaAsync().ConfigureAwait(false);
-        
-        _logger.LogDebug("{Method} called for topic {TopicName}", nameof(RunAsync), _topic);
-        
-        //sets a timeout for the fetch response.  If a rsult is not returned within this timeout then the call is cancelled
-        var timeoutTokenSource = new CancellationTokenSource(_subscriptionSettings.FetchResponseTimeout);
-        
-        //Polly retry policy to add resiliency to the the read of the response stream.
-        var retryPolicy = Policy.Handle<Exception>()
-            .WaitAndRetryForeverAsync((attempt, ctx) =>
-            {
-                var waitTime = !_subscriptionSettings.UseAttemptMultiplier ? _subscriptionSettings.SubscriptionRetryWait :
-                    _subscriptionSettings.SubscriptionRetryWait * Math.Max(((int)(ctx[ConsecutiveRetriesWithFailure])), 1);
-                return waitTime;
-            }, (Exception exception, int attempt, TimeSpan timespan, Context ctx) =>
-            {
-                _logger.LogDebug("Total retry attempts: {Attempts}, for topic: {Topic}", attempt, _topic);
-                
-                if (!stoppingToken.IsCancellationRequested)
-                {
-                    var msg = exception?.Message ?? "N/A";
-                    _logger.LogError(exception, "Error handling gRPC stream for topic: {TopicName}.  Returned error: {Message}. Attempting reconnect attempt: {Attempt} in {Timespan}",  _topic, msg, attempt, timespan);
-                    timeoutTokenSource = new CancellationTokenSource(timespan + _subscriptionSettings.FetchResponseTimeout);
-                    
-                    var consecutiveRetriesWithErrors = ((int)(ctx[ConsecutiveRetriesWithFailure]));
+        // Cache the schema for this topic once.
+await CacheSchemaAsync().ConfigureAwait(false);
+_logger.LogDebug("{Method} called for topic {TopicName}", nameof(RunAsync), _topic);
 
-                    if (consecutiveRetriesWithErrors > 0)
-                        _logger.LogWarning("{Attempts} attempts have been made to subscribe to {Topic} without success.  The services may be unavailable.  These messages will stop when connection has been reestablished", consecutiveRetriesWithErrors + 1, _topic);
-
-                    ctx[ConsecutiveRetriesWithFailure] = consecutiveRetriesWithErrors + 1;  //increase this by one
-                }
+// Continue running until cancellation is requested.
+while (!stoppingToken.IsCancellationRequested)
+{
+    // Create a fresh retry policy for each subscription cycle.
+    // This policy’s internal retry count will start at zero every time.
+    var retryPolicy = Policy
+        .Handle<Exception>()
+        .WaitAndRetryForeverAsync(
+            (retryCount, context) =>
+            {
+                // Calculate delay based on configuration.
+                return !_subscriptionSettings.UseAttemptMultiplier
+                    ? _subscriptionSettings.SubscriptionRetryWait
+                    : _subscriptionSettings.SubscriptionRetryWait * Math.Max(retryCount, 1);
+            },
+            (exception, retryCount, timeSpan, context) =>
+            {
+                _logger.LogDebug("Retry attempt {RetryCount} for topic {Topic}", retryCount, _topic);
+                _logger.LogError(
+                    exception,
+                    "Error on topic {Topic}: {Message}. Will retry in {Delay}ms.",
+                    _topic,
+                    exception.Message,
+                    timeSpan.TotalMilliseconds);
             });
 
-        //Polly doesn't allow the retry attempts counter to be reset.  There is an expectation the retries will be necessary for resiliency.  This will cause
-        //the Polly attempts to just keep incrementing.  Need to keep track of how many retries have occurred without a successful return from Salesforce
-        //if retries keep occurring with no successful return, then that is indicative of a bigger problem.  Warnings and backoff will be based off of this counter
-        //instead of the Polly retry counter.  Also, the Polly counter will throw a stack overflow exception if it every hits Int.Max
-        //TODO: is there a better way to handle this without having to track it myself
-        var policyContext = new Context("RetryContext") { { ConsecutiveRetriesWithFailure, 0} };
-        var policyResult = await retryPolicy.ExecuteAndCaptureAsync((ctx, ct) => SubscribeImplAsync(ctx, stoppingToken, timeoutTokenSource), policyContext, stoppingToken);
-        
-        _logger.LogDebug("{Method} finished for topic {TopicName}", nameof(RunAsync), _topic);
+    // Use a cancellation token source to enforce a fetch response timeout for this cycle.
+    using var fetchCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+    fetchCts.CancelAfter(_subscriptionSettings.FetchResponseTimeout);
+
+    try
+    {
+        // Execute the subscription operation. Note that each execution here
+        // is independent and gets a fresh Polly retry count.
+        await retryPolicy.ExecuteAsync(async ct =>
+        {
+            // SubscribeImplAsync will send a fetch request and process messages.
+            // On success (i.e. when messages are received), this execution completes,
+            // naturally resetting Polly’s internal retry counter.
+            await SubscribeImplAsync(new Context("RetryContext"), ct, fetchCts).ConfigureAwait(false);
+        }, stoppingToken).ConfigureAwait(false);
+    }
+    catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+    {
+        // Graceful shutdown.
+        break;
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Subscription cycle for topic {Topic} failed", _topic);
+        // Optionally add a short delay here before restarting the loop.
+        await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken).ConfigureAwait(false);
+    }
+}
+
+_logger.LogDebug("{Method} finished for topic {TopicName}", nameof(RunAsync), _topic);
     }
 
     /// <summary>
