@@ -16,7 +16,8 @@ namespace SalesforceIngestor.App;
 public static class ServiceCollectionExtensions
 {
     private static TimeSpan[] _httpBackoff = {TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(10)};
-    
+    private static IConfigurationRoot? _secretsConfig { get; set; }
+
     internal static IServiceCollection AddSalesforceIngestorAppDependencies(this IServiceCollection services, IConfiguration config)
     {
         services.ConfigureOptions<SubscriptionsConfigurer>();
@@ -41,6 +42,23 @@ public static class ServiceCollectionExtensions
         services.AddHostedService<MessageProcessorService>();
         services.AddHostedService<SubscriptionManagerService>();
 
+        // setup secrets for local dev, not to be stored in source control 
+        var devEnvVar = Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT");
+        var isDevEnvironment = string.IsNullOrEmpty(devEnvVar) || devEnvVar.ToUpper() == "DEVELOPMENT";
+
+        if (isDevEnvironment)
+        {
+            var builder = new ConfigurationBuilder();
+            builder.AddUserSecrets<Program>();
+            _secretsConfig = builder.Build();
+            services.Configure<Settings>(_secretsConfig?.GetSection("oAuthSecrets"));
+        }
+        else
+        {
+            //in a non-dev env set up your secrets via Azure Vault or equivalent
+            // ** DO NOT expose secret auth data in appsettings.json or in your ENV variables ** 
+        }
+
         services.AddSalesforceAuthenticationDependencies(settings =>
         {
             config.GetSection("salesforceAuthenticationSettings").Bind(settings);
@@ -56,7 +74,8 @@ public static class ServiceCollectionExtensions
         }).AddCallCredentials(async (context, metadata, provider) =>
         {
             var client = provider.GetRequiredService<ISalesforceTokenClient>();
-            var tokenResponse = await client.GetTokenResponseAsync().ConfigureAwait(false);
+            var grantType = config.GetSection("salesforceAuthenticationSettings").GetValue<String>("oAuthGrantType");
+            var tokenResponse = await client.GetTokenResponseAsync(grantType!).ConfigureAwait(false);
             metadata.Add("accesstoken", tokenResponse.AccessToken!);
             metadata.Add("instanceurl", tokenResponse.InstanceUrl!);
             metadata.Add("tenantid", tokenResponse.TenantId!);

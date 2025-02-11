@@ -15,7 +15,7 @@ namespace SalesforceIngestor.SalesforceAuthentication;
 
 public interface ISalesforceTokenClient
 {
-    Task<SalesforceTokenResponse> GetTokenResponseAsync(bool refresh = false);
+    Task<SalesforceTokenResponse> GetTokenResponseAsync(string grantType, bool refresh = false);
 }
 
 internal class SalesforceTokenClient : ISalesforceTokenClient
@@ -25,6 +25,7 @@ internal class SalesforceTokenClient : ISalesforceTokenClient
     private readonly IMemoryCache _memoryCache;
     private readonly Settings _settings;
     private static readonly SemaphoreSlim Locker = new SemaphoreSlim(1);
+    private string? _grantType;
 
     public SalesforceTokenClient(HttpClient client, IOptions<Settings> settings, IMemoryCache memoryCache)
     {
@@ -33,8 +34,9 @@ internal class SalesforceTokenClient : ISalesforceTokenClient
         _settings = settings?.Value ?? throw new ArgumentNullException(nameof(settings));
     }
 
-    public async Task<SalesforceTokenResponse> GetTokenResponseAsync(bool refresh = false)
+    public async Task<SalesforceTokenResponse> GetTokenResponseAsync(string grantType, bool refresh = false)
     {
+        _grantType = grantType;
         Lazy<Task<SalesforceTokenResponse>>? cacheItem;
         
         try
@@ -65,17 +67,31 @@ internal class SalesforceTokenClient : ISalesforceTokenClient
 
     private async Task<SalesforceTokenResponse> GetSalesforceTokenResponseAsyncImpl()
     {
-        var grant_type = "urn:ietf:params:oauth:grant-type:jwt-bearer";
-        var assertion = GetAssertion();
-
-
+     
         using (var req = new HttpRequestMessage(HttpMethod.Post, "services/oauth2/token"))
         {
-            req.Content = new FormUrlEncodedContent(new List<KeyValuePair<string, string>>()
+            switch (_grantType)
             {
-                new(nameof(grant_type), grant_type),
-                new(nameof(assertion), assertion)
-            });
+                case "bearer":
+                    var assertion = GetAssertion();
+                    req.Content = new FormUrlEncodedContent(new List<KeyValuePair<string, string>>()
+                    {
+                        new(nameof(String), "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                        new(nameof(assertion), assertion)
+                    });
+
+                    break;
+                default:
+                    req.Content = new FormUrlEncodedContent(new Dictionary<string, string>{
+                        { "username",_settings.UserName! },
+                        { "password", _settings.Password! },
+                        { "client_id", _settings.ClientId! },
+                        { "client_secret", _settings.ClientSecret! },
+                        { "grant_type", "password" }
+                    });
+
+                    break;
+            }
 
             using (var resp = await _client.SendAsync(req).ConfigureAwait(false))
             {
