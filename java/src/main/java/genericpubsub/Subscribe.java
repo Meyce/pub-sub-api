@@ -1,13 +1,13 @@
 package genericpubsub;
 
 import java.io.IOException;
-import java.time.Duration;
-import java.time.Instant;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import io.grpc.Metadata;
+import io.grpc.StatusRuntimeException;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
 
@@ -19,9 +19,10 @@ import utility.CommonContext;
 import utility.ExampleConfigurations;
 
 /**
- * A single-topic subscriber that consumes events using Event Bus API Subscribe RPC. The example demonstrates how to
- * subscribe to a fixed number of events and ends when they are received. It also demonstrates a basic flow control
- * strategy. This example does not implement any retry logic in case of failures. 
+ * A single-topic subscriber that consumes events using Event Bus API Subscribe RPC. The example demonstrates how to:
+ * - implement a long-lived subscription to a single topic
+ * - a basic flow control strategy
+ * - a basic retry strategy.
  *
  * Example:
  * ./run.sh genericpubsub.Subscribe
@@ -31,45 +32,49 @@ import utility.ExampleConfigurations;
 public class Subscribe extends CommonContext {
 
     public static int BATCH_SIZE;
-    public static AtomicBoolean receivedAllEvents = new AtomicBoolean(false);
+    public static int MAX_RETRIES = 3;
+    public static String ERROR_REPLAY_ID_VALIDATION_FAILED = "fetch.replayid.validation.failed";
+    public static String ERROR_REPLAY_ID_INVALID = "fetch.replayid.corrupted";
+    public static String ERROR_SERVICE_UNAVAILABLE = "service.unavailable";
+    public static int SERVICE_UNAVAILABLE_WAIT_BEFORE_RETRY_SECONDS = 5;
+    public static ExampleConfigurations exampleConfigurations;
     public static AtomicBoolean isActive = new AtomicBoolean(false);
-
+    public static AtomicInteger retriesLeft = new AtomicInteger(MAX_RETRIES);
     private StreamObserver<FetchRequest> serverStream;
     private Map<String, Schema> schemaCache = new ConcurrentHashMap<>();
     private AtomicInteger receivedEvents = new AtomicInteger(0);
-    private int totalEventsRequested;
-    private StreamObserver<FetchResponse> responseStreamObserver;
-    private ReplayPreset replayPreset;
-    private ByteString customReplayId;
-    private ByteString storedReplay;
+    private final StreamObserver<FetchResponse> responseStreamObserver;
+    private final ReplayPreset replayPreset;
+    private final ByteString customReplayId;
+    private final ScheduledExecutorService retryScheduler;
+    // Replay should be stored in replay store as bytes since replays are opaque.
+    private volatile ByteString storedReplay;
+    private final boolean processChangedFields;
 
     public Subscribe(ExampleConfigurations exampleConfigurations) {
         super(exampleConfigurations);
-        subscribeConstructorHelper(exampleConfigurations, getDefaultResponseStreamObserver());
+        isActive.set(true);
+        this.exampleConfigurations = exampleConfigurations;
+        this.BATCH_SIZE = exampleConfigurations.getNumberOfEventsToSubscribeInEachFetchRequest();
+        this.responseStreamObserver = getDefaultResponseStreamObserver();
+        this.setupTopicDetails(exampleConfigurations.getTopic(), false, false);
+        this.replayPreset = exampleConfigurations.getReplayPreset();
+        this.customReplayId = exampleConfigurations.getReplayId();
+        this.retryScheduler = Executors.newScheduledThreadPool(1);
+        this.processChangedFields = exampleConfigurations.getProcessChangedFields();
     }
 
-    // Constructor that can be used in other examples with a custom StreamObserver.
     public Subscribe(ExampleConfigurations exampleConfigurations, StreamObserver<FetchResponse> responseStreamObserver) {
         super(exampleConfigurations);
-        subscribeConstructorHelper(exampleConfigurations, responseStreamObserver);
-    }
-
-    /**
-     * Helper function to the constructors to initialize the member variables.
-     *
-     * @param exampleConfigurations
-     * @param responseStreamObserver
-     */
-    public void subscribeConstructorHelper(ExampleConfigurations exampleConfigurations, StreamObserver<FetchResponse> responseStreamObserver) {
-        receivedAllEvents.set(false);
         isActive.set(true);
-        Integer numberOfEvents = exampleConfigurations.getNumberOfEventsToSubscribe();
-        this.totalEventsRequested = (numberOfEvents == null || numberOfEvents == 0) ? 100 : numberOfEvents;
-        this.BATCH_SIZE = Math.min(5, exampleConfigurations.getNumberOfEventsToSubscribe());
+        this.exampleConfigurations = exampleConfigurations;
+        this.BATCH_SIZE = exampleConfigurations.getNumberOfEventsToSubscribeInEachFetchRequest();
         this.responseStreamObserver = responseStreamObserver;
         this.setupTopicDetails(exampleConfigurations.getTopic(), false, false);
         this.replayPreset = exampleConfigurations.getReplayPreset();
         this.customReplayId = exampleConfigurations.getReplayId();
+        this.retryScheduler = Executors.newScheduledThreadPool(1);
+        this.processChangedFields = exampleConfigurations.getProcessChangedFields();
     }
 
     /**
@@ -77,15 +82,53 @@ public class Subscribe extends CommonContext {
      */
     public void startSubscription() {
         logger.info("Subscription started for topic: " + busTopicName + ".");
+        fetch(BATCH_SIZE, busTopicName, replayPreset, customReplayId);
+        // Thread being blocked here for demonstration of this specific example. Blocking the thread in production is not recommended.
+        while(isActive.get()) {
+            waitInMillis(5_000);
+            logger.info("Subscription Active. Received a total of " + receivedEvents.get() + " events.");
+        }
+    }
+
+    /** Helper function to send FetchRequests.
+     * @param providedBatchSize
+     * @param providedTopicName
+     * @param providedReplayPreset
+     * @param providedReplayId
+     */
+    public void fetch(int providedBatchSize, String providedTopicName, ReplayPreset providedReplayPreset, ByteString providedReplayId) {
         serverStream = asyncStub.subscribe(this.responseStreamObserver);
         FetchRequest.Builder fetchRequestBuilder = FetchRequest.newBuilder()
-                .setReplayPreset(replayPreset)
-                .setTopicName(this.busTopicName)
-                .setNumRequested(BATCH_SIZE);
-        if (this.replayPreset == ReplayPreset.CUSTOM) {
-            fetchRequestBuilder.setReplayId(customReplayId);
+                .setNumRequested(providedBatchSize)
+                .setTopicName(providedTopicName)
+                .setReplayPreset(providedReplayPreset);
+        if (providedReplayPreset == ReplayPreset.CUSTOM) {
+            logger.info("Subscription has Replay Preset set to CUSTOM. In this case, the events will be delivered from provided ReplayId.");
+            fetchRequestBuilder.setReplayId(providedReplayId);
         }
         serverStream.onNext(fetchRequestBuilder.build());
+    }
+
+    /**
+     * Function to decide the delay (in ms) in sending FetchRequests using
+     * Binary Exponential Backoff - Waits for 2^(Max Number of Retries - Retries Left) * 1000.
+     */
+    public long getBackoffWaitTime() {
+        long waitTime = (long) (Math.pow(2, MAX_RETRIES - retriesLeft.get()) * 1000);
+        return waitTime;
+    }
+
+    /**
+     * Helper function to halt the current thread.
+     */
+    public void waitInMillis(long duration) {
+        synchronized (this) {
+            try {
+                this.wait(duration);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+        }
     }
 
     /**
@@ -107,41 +150,117 @@ public class Subscribe extends CommonContext {
                     }
                     receivedEvents.addAndGet(1);
                 }
+                // Latest replayId stored for any future FetchRequests with CUSTOM ReplayPreset.
+                // NOTE: Replay IDs are opaque in nature and should be stored and used as bytes without any conversion.
                 storedReplay = fetchResponse.getLatestReplayId();
 
-                if (receivedEvents.get() >= totalEventsRequested) {
-                    receivedAllEvents.set(true);
+                // Reset retry count
+                if (retriesLeft.get() != MAX_RETRIES) {
+                    retriesLeft.set(MAX_RETRIES);
                 }
 
                 // Implementing a basic flow control strategy where the next fetchRequest is sent only after the
                 // requested number of events in the previous fetchRequest(s) are received.
-                if (fetchResponse.getPendingNumRequested() == 0 && !receivedAllEvents.get()) {
-                    fetchMore(Math.min(BATCH_SIZE, totalEventsRequested-receivedEvents.get()));
+                // NOTE: This block may need to be implemented before the processing of events if event processing takes
+                // a long time. There is a 70s timeout period during which, if pendingNumRequested is 0 and no events are
+                // further requested then the stream will be closed.
+                if (fetchResponse.getPendingNumRequested() == 0) {
+                    fetchMore(BATCH_SIZE);
                 }
             }
 
             @Override
             public void onError(Throwable t) {
                 printStatusRuntimeException("Error during Subscribe", (Exception) t);
-                isActive.set(false);
-                // Retry logic should be added here if needed as this example does not demonstrate retries in case of failures.
+                logger.info("Retries remaining: " + retriesLeft.get());
+                if (retriesLeft.get() == 0) {
+                    logger.info("Exhausted all retries. Closing Subscription.");
+                    isActive.set(false);
+                } else {
+                    retriesLeft.decrementAndGet();
+                    Metadata trailers = ((StatusRuntimeException)t).getTrailers() != null ? ((StatusRuntimeException)t).getTrailers() : null;
+                    String errorCode = (trailers != null && trailers.get(Metadata.Key.of("error-code", Metadata.ASCII_STRING_MARSHALLER)) != null) ?
+                            trailers.get(Metadata.Key.of("error-code", Metadata.ASCII_STRING_MARSHALLER)) : null;
+
+                    // Closing the old stream for sanity
+                    serverStream.onCompleted();
+
+                    ReplayPreset retryReplayPreset = ReplayPreset.LATEST;
+                    ByteString retryReplayId = null;
+                    long retryDelay = getBackoffWaitTime();
+
+                    // Retry strategies that can be implemented based on the error type.
+                    if(errorCode != null && !errorCode.isEmpty()) {
+                        if (errorCode.contains(ERROR_REPLAY_ID_VALIDATION_FAILED) || errorCode.contains(ERROR_REPLAY_ID_INVALID)) {
+                            logger.info("Invalid or no replayId provided in FetchRequest for CUSTOM Replay. Trying again with EARLIEST Replay.");
+                            retryReplayPreset = ReplayPreset.EARLIEST;
+                        } else if (errorCode.contains(ERROR_SERVICE_UNAVAILABLE)) {
+                            logger.info("Service currently unavailable. Trying again with LATEST Replay.");
+                            retryDelay = SERVICE_UNAVAILABLE_WAIT_BEFORE_RETRY_SECONDS * 1000;
+                        } else {
+                            if (storedReplay != null) {
+                                logger.info("Retrying with Stored Replay.");
+                                retryReplayPreset = ReplayPreset.CUSTOM;
+                                retryReplayId = getStoredReplay();
+                            } else {
+                                logger.info("Retrying with LATEST Replay.");
+                            }
+
+                        }
+                    } else {
+                        logger.info("Unknown error. Retrying with LATEST Replay.");
+                    }
+                    logger.info(String.format("Retrying in %s ms.", retryDelay));
+                    retryScheduler.schedule(new RetryRequestSender(retryReplayPreset, retryReplayId), retryDelay, TimeUnit.MILLISECONDS);
+                }
             }
 
             @Override
             public void onCompleted() {
-                logger.info("Received requested number of " + totalEventsRequested + " events! Call completed by server.");
+                logger.info("Call completed by server. Closing Subscription.");
                 isActive.set(false);
             }
         };
     }
 
+    /**
+     * A Runnable class that is used to send the FetchRequests by making a new Subscribe call while retrying on
+     * receiving an error. This is done in order to avoid blocking the thread while waiting for retries. This class is
+     * passed to the ScheduledExecutorService which will asynchronously send the FetchRequests during retries.
+     */
+    private class RetryRequestSender implements Runnable {
+        private ReplayPreset retryReplayPreset;
+        private ByteString retryReplayId;
+        public RetryRequestSender(ReplayPreset replayPreset, ByteString replayId) {
+            this.retryReplayPreset = replayPreset;
+            this.retryReplayId = replayId;
+        }
+
+        @Override
+        public void run() {
+            fetch(BATCH_SIZE, busTopicName, retryReplayPreset, retryReplayId);
+            logger.info("Retry FetchRequest Sent.");
+        }
+    }
+
+    /**
+     * Helper function to process the events received.
+     */
     private void processEvent(ConsumerEvent ce) throws IOException {
         Schema writerSchema = getSchema(ce.getEvent().getSchemaId());
         this.storedReplay = ce.getReplayId();
         GenericRecord record = deserialize(writerSchema, ce.getEvent().getPayload());
-        logger.info("Received event with payload: " + record.toString());
+        logger.info("Received event with payload: " + record.toString() + " with schema name: " + writerSchema.getName());
+        if (processChangedFields) {
+            // This example expands the changedFields bitmap field in ChangeEventHeader.
+            // To expand the other bitmap fields, i.e., diffFields and nulledFields, replicate or modify this code.
+            processAndPrintBitmapFields(writerSchema, record, "changedFields");
+        }
     }
 
+    /**
+     * Helper function to get the schema of an event if it does not already exist in the schema cache.
+     */
     public Schema getSchema(String schemaId) {
         return schemaCache.computeIfAbsent(schemaId, id -> {
             SchemaRequest request = SchemaRequest.newBuilder().setSchemaId(id).build();
@@ -162,40 +281,6 @@ public class Subscribe extends CommonContext {
     }
 
     /**
-     * Main objective of this function is to keep the main thread active along with the gRPC threads.
-     * The `maxTimeout` parameter is used to specify the maximum amount of time the subscription can
-     * stay alive when idle, i.e., while not receiving any events.
-     *
-     * @param maxTimeout
-     * @throws InterruptedException
-     */
-    public synchronized void waitForEventsWithMaxTimeout(int maxTimeout) throws InterruptedException {
-        final Instant startTime = Instant.now();
-        while(!receivedAllEvents.get() && isActive.get()) {
-            final long elapsed = Duration.between(startTime, Instant.now()).getSeconds();
-
-            if (elapsed > maxTimeout) {
-                logger.info("Exceeded timeout of " + maxTimeout + " while waiting for events. Received " + receivedEvents.get() + " events. Exiting.");
-                return;
-            }
-
-            logger.info("Subscription Active. Received " + receivedEvents.get() + " events.");
-            if (receivedEvents.get() < totalEventsRequested) {
-                this.wait(5_000);
-            }
-        }
-    }
-
-    /**
-     * Default function to wait for events indefinitely.
-     *
-     * @throws InterruptedException
-     */
-    public synchronized void waitForEvents() throws InterruptedException {
-        waitForEventsWithMaxTimeout(Integer.MAX_VALUE);
-    }
-
-    /**
      * General getters and setters.
      */
     public AtomicInteger getReceivedEvents() {
@@ -206,12 +291,15 @@ public class Subscribe extends CommonContext {
         receivedEvents.addAndGet(delta);
     }
 
-    public int getTotalEventsRequested() {
-        return totalEventsRequested;
-    }
-
     public int getBatchSize() {
         return BATCH_SIZE;
+    }
+    public ByteString getStoredReplay() {
+        return storedReplay;
+    }
+
+    public void setStoredReplay(ByteString storedReplay) {
+        this.storedReplay = storedReplay;
     }
 
     /**
@@ -222,6 +310,9 @@ public class Subscribe extends CommonContext {
         try {
             if (serverStream != null) {
                 serverStream.onCompleted();
+            }
+            if (retryScheduler != null) {
+                retryScheduler.shutdown();
             }
         } catch (Exception e) {
             logger.info(e.toString());
@@ -236,7 +327,6 @@ public class Subscribe extends CommonContext {
         // order to close the resources used.
         try (Subscribe subscribe = new Subscribe(exampleConfigurations)) {
             subscribe.startSubscription();
-            subscribe.waitForEvents();
         } catch (Exception e) {
             printStatusRuntimeException("Error during Subscribe", e);
         }

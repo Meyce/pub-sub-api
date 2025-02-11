@@ -2,10 +2,13 @@ package utility;
 
 import java.io.*;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericDatumReader;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.generic.GenericRecordBuilder;
@@ -17,10 +20,13 @@ import org.eclipse.jetty.client.HttpProxy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.base.CaseFormat;
 import com.google.protobuf.ByteString;
 import com.salesforce.eventbus.protobuf.*;
 
 import io.grpc.*;
+
+import static utility.EventParser.getFieldListFromBitmap;
 
 /**
  * The CommonContext class provides a list of member variables and functions that is used across
@@ -62,8 +68,10 @@ public class CommonContext implements AutoCloseable {
         callCredentials = setupCallCredentials(options);
         sessionToken = ((APISessionCredentials) callCredentials).getToken();
 
-        asyncStub = PubSubGrpc.newStub(channel).withCallCredentials(callCredentials);
-        blockingStub = PubSubGrpc.newBlockingStub(channel).withCallCredentials(callCredentials);
+        Channel interceptedChannel = ClientInterceptors.intercept(channel, new XClientTraceIdClientInterceptor());
+
+        asyncStub = PubSubGrpc.newStub(interceptedChannel).withCallCredentials(callCredentials);
+        blockingStub = PubSubGrpc.newBlockingStub(interceptedChannel).withCallCredentials(callCredentials);
     }
 
     /**
@@ -172,31 +180,52 @@ public class CommonContext implements AutoCloseable {
     }
 
     /**
-     * Helper function to create an event of the CarMaintenance topic.
+     * Helper function to create an event.
+     * Currently generates event message for the topic "Order Event". Modify the fields
+     * accordingly for an event of your choice.
      *
      * @param schema schema of the topic
      * @return
      */
-    public GenericRecord createCarMaintenanceRecord(Schema schema) {
-        // Please remember to use the appropriate orgId for the CreatedById field.
-        return new GenericRecordBuilder(schema).set("CreatedDate", System.currentTimeMillis() / 1000)
-                .set("CreatedById", "005xx000001Svwo").set("Mileage__c", 95443.0).set("Cost__c", 99.40)
-                .set("WorkDescription__c", "Replaced front brakes").build();
+    public GenericRecord createEventMessage(Schema schema) {
+        // Update CreatedById with the appropriate User Id from your org.
+        return new GenericRecordBuilder(schema).set("CreatedDate", System.currentTimeMillis())
+                .set("CreatedById", "<User_Id>").set("Order_Number__c", "1")
+                .set("City__c", "Los Angeles").set("Amount__c", 35.0).build();
     }
 
     /**
-     * Helper function to create an event of the CarMaintenance topic with a counter appended to
-     * the end of the WorkDescription. Used while publishing multiple events.
+     * Helper function to create an event with a counter appended to
+     * the end of a Text field. Used while publishing multiple events.
+     * Currently generates event message for the topic "Order Event". Modify the fields
+     * accordingly for an event of your choice.
      *
      * @param schema schema of the topic
-     * @param counter counter to be appended towards the end of the WorkDescription
+     * @param counter counter to be appended towards the end of any Text Field
      * @return
      */
-    public GenericRecord createCarMaintenanceRecord(Schema schema, final int counter) {
-        // Please remember to use the appropriate orgId for the CreatedById field.
-        return new GenericRecordBuilder(schema).set("CreatedDate", System.currentTimeMillis() / 1000)
-                .set("CreatedById", "005xx000001Svwo").set("Mileage__c", 95443.0).set("Cost__c", 99.40)
-                .set("WorkDescription__c", "Replaced front brakes; event: " + counter).build();
+    public GenericRecord createEventMessage(Schema schema, final int counter) {
+        // Update CreatedById with the appropriate User Id from your org.
+        return new GenericRecordBuilder(schema).set("CreatedDate", System.currentTimeMillis())
+                .set("CreatedById", "<User_Id>").set("Order_Number__c", String.valueOf(counter+1))
+                .set("City__c", "Los Angeles").set("Amount__c", 35.0).build();
+    }
+
+    public List<GenericRecord> createEventMessages(Schema schema, final int numEvents) {
+
+        String[] orderNumbers = {"99","100","101","102","103"};
+        String[] cities = {"Los Angeles", "New York", "San Francisco", "San Jose", "Boston"};
+        Double[] amounts = {35.0, 20.0, 2.0, 123.0, 180.0};
+
+        // Update CreatedById with the appropriate User Id from your org.
+        List<GenericRecord> events = new ArrayList<>();
+        for (int i=0; i<numEvents; i++) {
+            events.add(new GenericRecordBuilder(schema).set("CreatedDate", System.currentTimeMillis())
+                    .set("CreatedById", "<User_Id>").set("Order_Number__c", orderNumbers[i % 5])
+                    .set("City__c", cities[i % 5]).set("Amount__c", amounts[i % 5]).build());
+        }
+
+        return events;
     }
 
 
@@ -240,6 +269,36 @@ public class CommonContext implements AutoCloseable {
     }
 
     /**
+     * Helper function to process and print bitmap fields
+     *
+     * @param schema
+     * @param record
+     * @param bitmapField
+     * @return
+     */
+    public static void processAndPrintBitmapFields(Schema schema, GenericRecord record, String bitmapField) {
+        String bitmapFieldPascal = CaseFormat.LOWER_CAMEL.to(CaseFormat.UPPER_CAMEL, bitmapField);
+        try {
+            List<String> changedFields = getFieldListFromBitmap(schema,
+                    (GenericData.Record) record.get("ChangeEventHeader"), bitmapField);
+            if (!changedFields.isEmpty()) {
+                logger.info("============================");
+                logger.info("       " + bitmapFieldPascal + "       ");
+                logger.info("============================");
+                for (String field : changedFields) {
+                    logger.info(field);
+                }
+                logger.info("============================\n");
+            } else {
+                logger.info("No " + bitmapFieldPascal + " found\n");
+            }
+        } catch (Exception e) {
+            logger.info("Trying to process " + bitmapFieldPascal + " on unsupported events or no " +
+                    bitmapFieldPascal + " found. Error: " + e.getMessage() + "\n");
+        }
+    }
+
+    /**
      * Helper function to setup Subscribe configurations in some examples.
      *
      * @param requiredParams
@@ -250,11 +309,8 @@ public class CommonContext implements AutoCloseable {
         ExampleConfigurations subParams = new ExampleConfigurations();
         setCommonParameters(subParams, requiredParams);
         subParams.setTopic(topic);
-        subParams.setReplayPreset(requiredParams.getReplayPreset());
-        if (requiredParams.getReplayPreset() == ReplayPreset.CUSTOM) {
-            subParams.setReplayId(requiredParams.getReplayId());
-        }
-        subParams.setNumberOfEventsToSubscribe(numberOfEvents);
+        subParams.setReplayPreset(ReplayPreset.LATEST);
+        subParams.setNumberOfEventsToSubscribeInEachFetchRequest(numberOfEvents);
         return subParams;
     }
 

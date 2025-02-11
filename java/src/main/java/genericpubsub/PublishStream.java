@@ -3,6 +3,7 @@ package genericpubsub;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -25,7 +26,7 @@ import utility.CommonContext;
 import utility.ExampleConfigurations;
 
 /**
- * A single-topic publisher that creates CarMaintenance events and publishes them. This example
+ * A single-topic publisher that creates Order Event events and publishes them. This example
  * uses Pub/Sub API's PublishStream RPC to publish events.
  *
  * Example:
@@ -37,6 +38,8 @@ public class PublishStream extends CommonContext {
     private final int TIMEOUT_SECONDS = 30; // Max time we'll wait to finish streaming
 
     ClientCallStreamObserver<PublishRequest> requestObserver = null;
+
+    private ByteString lastPublishedReplayId;
 
     public PublishStream(ExampleConfigurations exampleConfigurations) {
         super(exampleConfigurations);
@@ -50,26 +53,30 @@ public class PublishStream extends CommonContext {
      * @return ByteString
      * @throws Exception
      */
-    public ByteString publishStream(int numEventsToPublish) throws Exception {
+    public void publishStream(int numEventsToPublish, Boolean singlePublishRequest) throws Exception {
         CountDownLatch finishLatch = new CountDownLatch(1);
         AtomicReference<CountDownLatch> finishLatchRef = new AtomicReference<>(finishLatch);
-        final List<Status> errorStatuses = Lists.newArrayList();
-        final List<PublishResponse> publishResponses = Lists.newArrayListWithExpectedSize(numEventsToPublish);
+        final int numExpectedPublishResponses = singlePublishRequest ? 1 : numEventsToPublish;
+        final List<PublishResponse> publishResponses = Lists.newArrayListWithExpectedSize(numExpectedPublishResponses);
         AtomicInteger failed = new AtomicInteger(0);
-        StreamObserver<PublishResponse> pubObserver = getDefaultPublishStreamObserver(errorStatuses, finishLatchRef,
-                numEventsToPublish, publishResponses, failed);
+        StreamObserver<PublishResponse> pubObserver = getDefaultPublishStreamObserver(finishLatchRef,
+                numExpectedPublishResponses, publishResponses, failed);
 
         // construct the stream
         requestObserver = (ClientCallStreamObserver<PublishRequest>) asyncStub.publishStream(pubObserver);
 
-        for (int i = 0; i < numEventsToPublish; i++) {
-            requestObserver.onNext(generatePublishRequest(i));
+        if (singlePublishRequest == false) {
+            // Publish each event in a separate batch
+            for (int i = 0; i < numEventsToPublish; i++) {
+                requestObserver.onNext(generatePublishRequest(i, singlePublishRequest));
+            }
+        } else {
+            // Publish all events in one batch
+            requestObserver.onNext(generatePublishRequest(numEventsToPublish, singlePublishRequest));
         }
 
-        ByteString lastPublishedReplayId = validatePublishResponse(errorStatuses, finishLatch, numEventsToPublish,
-                publishResponses, failed);
+        validatePublishResponse(finishLatch, numExpectedPublishResponses, publishResponses, failed, numEventsToPublish);
         requestObserver.onCompleted();
-        return lastPublishedReplayId;
     }
 
     /**
@@ -82,36 +89,33 @@ public class PublishStream extends CommonContext {
      * @return
      * @throws Exception
      */
-    private ByteString validatePublishResponse(List<Status> errorStatus, CountDownLatch finishLatch,
-                                               int expectedResponseCount, List<PublishResponse> publishResponses, AtomicInteger failed) throws Exception {
+    private void validatePublishResponse(CountDownLatch finishLatch,
+                                               int expectedResponseCount, List<PublishResponse> publishResponses, AtomicInteger failed, int expectedNumEventsPublished) throws Exception {
         String exceptionMsg;
-        final long LATEST = -1;
-        ByteString lastPublishedReplayId = getReplayIdFromLong(LATEST);
+        boolean failedPublish = false;
         if (!finishLatch.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            failedPublish = true;
             exceptionMsg = "[ERROR] publishStream timed out after: " + TIMEOUT_SECONDS + "sec";
             logger.error(exceptionMsg);
         }
 
-        boolean receivedAllResponses = true;
         if (expectedResponseCount != publishResponses.size()) {
-            receivedAllResponses = false;
-            exceptionMsg = "[ERROR] PublishStream received: " + publishResponses.size() + " events instead of expected "
+            failedPublish = true;
+            exceptionMsg = "[ERROR] PublishStream received: " + publishResponses.size() + " PublishResponses instead of expected "
                     + expectedResponseCount;
             logger.error(exceptionMsg);
-
-            errorStatus.stream().forEach(status -> {
-                logger.error("[ERROR] Unexpected error status: " + status);
-            });
         }
 
-        if (failed.get() != 0 || !receivedAllResponses) {
+        if (failed.get() != 0) {
+            failedPublish = true;
             exceptionMsg = "[ERROR] Failed to publish all events. " + failed + " failed out of "
-                    + expectedResponseCount;
+                    + expectedNumEventsPublished;
             logger.error(exceptionMsg);
-            throw new Exception(exceptionMsg);
         }
 
-        return lastPublishedReplayId;
+        if (failedPublish) {
+            throw new RuntimeException("Failed to publish events.");
+        }
     }
 
     /**
@@ -123,7 +127,7 @@ public class PublishStream extends CommonContext {
      */
     private ProducerEvent generateProducerEvent(int counter) throws IOException {
         Schema schema = new Schema.Parser().parse(schemaInfo.getSchemaJson());
-        GenericRecord event = createCarMaintenanceRecord(schema, counter);
+        GenericRecord event = createEventMessage(schema, counter);
 
         // Convert to byte array
         GenericDatumWriter<GenericRecord> writer = new GenericDatumWriter<>(event.getSchema());
@@ -136,15 +140,53 @@ public class PublishStream extends CommonContext {
     }
 
     /**
+     * Creates an array of ProducerEvents to be published in a PublishRequest.
+     *
+     * @param count
+     * @return
+     * @throws IOException
+     */
+    private ProducerEvent[] generateProducerEvents(int count) throws IOException {
+        Schema schema = new Schema.Parser().parse(schemaInfo.getSchemaJson());
+        List<GenericRecord> events = createEventMessages(schema, count);
+
+        ProducerEvent[] prodEvents = new ProducerEvent[count];
+        GenericDatumWriter<GenericRecord> writer = new GenericDatumWriter<>(events.get(0).getSchema());
+
+        for(int i=0; i<count; i++) {
+            // Convert to byte array
+            ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+            BinaryEncoder encoder = EncoderFactory.get().directBinaryEncoder(buffer, null);
+            writer.write(events.get(i), encoder);
+            // Setting event id which can be used to correlate PublishResponses returned from Pub/Sub API server
+            prodEvents[i] = ProducerEvent.newBuilder().setSchemaId(schemaInfo.getSchemaId())
+                    .setPayload(ByteString.copyFrom(buffer.toByteArray())).setId(UUID.randomUUID().toString()).build();
+        }
+
+        return prodEvents;
+    }
+
+    /**
      * Helper function to generate the PublishRequest with the generated ProducerEvent to be sent
      * using the PublishStream RPC
      *
      * @return PublishRequest
      * @throws IOException
      */
-    private PublishRequest generatePublishRequest(int counter) throws IOException {
-        ProducerEvent e = generateProducerEvent(counter);
-        return PublishRequest.newBuilder().setTopicName(busTopicName).addEvents(e).build();
+    private PublishRequest generatePublishRequest(int count, Boolean singlePublishRequest) throws IOException {
+        if (singlePublishRequest == false) {
+            // One event per batch
+            ProducerEvent e = generateProducerEvent(count);
+            return PublishRequest.newBuilder().setTopicName(busTopicName).addEvents(e).build();
+        } else {
+            // Multiple events per batch
+            ProducerEvent[] prodEvents = generateProducerEvents(count);
+            PublishRequest.Builder p = PublishRequest.newBuilder().setTopicName(busTopicName);
+            for(int i=0; i<count; i++) {
+                p.addEvents(prodEvents[i]);
+            }
+            return p.build();
+        }
     }
 
     /**
@@ -156,8 +198,7 @@ public class PublishStream extends CommonContext {
      * @param publishResponses
      * @return
      */
-    private StreamObserver<PublishResponse> getDefaultPublishStreamObserver(List<Status> errorStatus,
-                                                                            AtomicReference<CountDownLatch> finishLatchRef, int expectedResponseCount,
+    private StreamObserver<PublishResponse> getDefaultPublishStreamObserver(AtomicReference<CountDownLatch> finishLatchRef, int expectedResponseCount,
                                                                             List<PublishResponse> publishResponses, AtomicInteger failed) {
         return new StreamObserver<>() {
             @Override
@@ -169,13 +210,13 @@ public class PublishStream extends CommonContext {
                 for (PublishResult publishResult : publishResponse.getResultsList()) {
                     if (publishResult.hasError()) {
                         failed.incrementAndGet();
-                        logger.error("[ERROR] Publishing event having correlationKey: " + publishResult.getCorrelationKey() +
+                        logger.error("[ERROR] Publishing event with correlationKey: " + publishResult.getCorrelationKey() +
                                 " failed with error: " + publishResult.getError().getMsg());
                     } else {
-                        logger.info("Event publish successful with correlationKey: " + publishResult.getCorrelationKey());
+                        logger.info("Event published with correlationKey: " + publishResult.getCorrelationKey());
+                        lastPublishedReplayId = publishResult.getReplayId();
                     }
                 }
-
                 if (publishResponses.size() == expectedResponseCount) {
                     finishLatchRef.get().countDown();
                 }
@@ -183,14 +224,14 @@ public class PublishStream extends CommonContext {
 
             @Override
             public void onError(Throwable t) {
+                logger.error("[ERROR] Unexpected error status: " + Status.fromThrowable(t));
                 printStatusRuntimeException("Error during PublishStream", (Exception) t);
-                errorStatus.add(Status.fromThrowable(t));
                 finishLatchRef.get().countDown();
             }
 
             @Override
             public void onCompleted() {
-                logger.info("Successfully published " + expectedResponseCount + " events at " + busTopicName + " for tenant " + tenantGuid);
+                logger.info("Successfully published events for topic " + busTopicName + " for tenant " + tenantGuid);
                 finishLatchRef.get().countDown();
             }
         };
@@ -202,7 +243,8 @@ public class PublishStream extends CommonContext {
         // Using the try-with-resource statement. The CommonContext class implements AutoCloseable in
         // order to close the resources used.
         try (PublishStream example = new PublishStream(exampleConfigurations)) {
-            example.publishStream(exampleConfigurations.getNumberOfEventsToPublish());
+            example.publishStream(exampleConfigurations.getNumberOfEventsToPublish(),
+                                  exampleConfigurations.getSinglePublishRequest());
         } catch (Exception e) {
             printStatusRuntimeException("Error During PublishStream", e);
         }

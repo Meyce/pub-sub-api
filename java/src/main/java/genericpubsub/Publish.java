@@ -16,7 +16,7 @@ import utility.CommonContext;
 import utility.ExampleConfigurations;
 
 /**
- * A single-topic publisher that creates a CarMaintenance event and publishes it. This example uses
+ * A single-topic publisher that creates an Order Event event and publishes it. This example uses
  * Pub/Sub API's Publish RPC to publish events.
  *
  * Example:
@@ -42,7 +42,7 @@ public class Publish extends CommonContext {
      */
     private ProducerEvent generateProducerEvent() throws IOException {
         Schema schema = new Schema.Parser().parse(schemaInfo.getSchemaJson());
-        GenericRecord event = createCarMaintenanceRecord(schema);
+        GenericRecord event = createEventMessage(schema);
 
         // Convert to byte array
         GenericDatumWriter<GenericRecord> writer = new GenericDatumWriter<>(event.getSchema());
@@ -95,8 +95,7 @@ public class Publish extends CommonContext {
      * @return
      */
     private ByteString validatePublishResponse(PublishResponse response) {
-        final long LATEST = -1;
-        ByteString lastPublishedReplayId = getReplayIdFromLong(LATEST);
+        ByteString lastPublishedReplayId = null;
         List<PublishResult> resultList = response.getResultsList();
         if (resultList.size() != 1) {
             String errorMsg = "[ERROR] Error during Publish, received: " + resultList.size() + " events instead of expected 1";

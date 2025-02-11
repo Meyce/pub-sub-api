@@ -46,7 +46,7 @@ public class AccountUpdateAppUtil {
      */
     protected static GenericRecord createNewAccountRecord(Schema schema, String accountRecordId) {
         return new GenericRecordBuilder(schema).set("CreatedDate", System.currentTimeMillis() / 1000)
-                .set("CreatedById", "005xx000001Svwo").set("AccountRecordId__c", accountRecordId).build();
+                .set("CreatedById", "<User_Id>").set("AccountRecordId__c", accountRecordId).build();
     }
 
     /**
@@ -126,6 +126,7 @@ public class AccountUpdateAppUtil {
 
         if (res > 299) {
             logger.info("Unable to update Account Record.");
+            logger.info(response.getContentAsString());
         } else {
             logger.info("Successfully updated Account Record. Updated AccountNumber: " + accountNumber);
         }
